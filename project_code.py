@@ -1,3 +1,4 @@
+import os
 import tkinter as tk
 from tkinter import simpledialog, messagebox, filedialog, scrolledtext
 import pywhatkit
@@ -87,8 +88,12 @@ def select_image():
         result_text.insert(tk.END, result)
 
 def send_email():
-    sender_email = 'ansarimohdasif128@gmail.com'  # Update with your email
-    password = 'kkuj xtph gxmf qetp'  # Update with your email password
+    sender_email = os.environ.get('SENDER_EMAIL')
+    password = os.environ.get('EMAIL_PASSWORD')
+
+    if not sender_email or not password:
+        messagebox.showerror("Configuration Error", "SENDER_EMAIL and EMAIL_PASSWORD environment variables must be set.")
+        return
 
     receiver_email = simpledialog.askstring("Receiver Email", "Enter receiver's email:")
     message = simpledialog.askstring("Message", "Enter your message:")
