@@ -10,7 +10,6 @@ only when a user runs the matching tool.
 from __future__ import annotations
 
 import argparse
-import base64
 import importlib
 import importlib.util
 import io
@@ -19,6 +18,7 @@ import os
 import sys
 import webbrowser
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,8 +33,8 @@ FEATURE_DEPENDENCIES = {
     "hand_gestures": ["cv2", "cvzone.HandTrackingModule"],
     "ec2": ["boto3"],
     "s3": ["boto3"],
-    "search_summary": ["requests", "cohere"],
-    "image_detection": ["requests", "cohere"],
+    "search_summary": ["requests", "huggingface_hub"],
+    "image_detection": ["huggingface_hub"],
 }
 
 
@@ -62,9 +62,10 @@ def optional_import(module_name: str, package_name: str | None = None) -> Any:
 class AppConfig:
     sender_email: str | None = None
     email_password: str | None = None
-    cohere_api_key: str | None = None
+    hf_token: str | None = None
+    hf_text_model: str = "HuggingFaceH4/zephyr-7b-beta"
+    hf_vision_model: str = "Salesforce/blip-image-captioning-large"
     serpapi_api_key: str | None = None
-    vision_api_key: str | None = None
     s3_bucket: str = "dossttpprojectbucket"
     aws_region: str | None = None
     ec2_ami_id: str = "ami-09298640a92b2d12c"
@@ -76,9 +77,10 @@ class AppConfig:
         return cls(
             sender_email=os.getenv("SENDER_EMAIL"),
             email_password=os.getenv("EMAIL_PASSWORD"),
-            cohere_api_key=os.getenv("COHERE_API_KEY"),
+            hf_token=os.getenv("HF_TOKEN"),
+            hf_text_model=os.getenv("HF_TEXT_MODEL", cls.hf_text_model),
+            hf_vision_model=os.getenv("HF_VISION_MODEL", cls.hf_vision_model),
             serpapi_api_key=os.getenv("SERPAPI_API_KEY"),
-            vision_api_key=os.getenv("VISION_API_KEY"),
             s3_bucket=os.getenv("S3_BUCKET", cls.s3_bucket),
             aws_region=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION"),
             ec2_ami_id=os.getenv("EC2_AMI_ID", cls.ec2_ami_id),
@@ -92,13 +94,15 @@ class AppConfig:
                 "SENDER_EMAIL": self.sender_email,
                 "EMAIL_PASSWORD": self.email_password,
             },
-            "cohere": {"COHERE_API_KEY": self.cohere_api_key},
+            "huggingface": {"HF_TOKEN": self.hf_token},
             "serpapi": {"SERPAPI_API_KEY": self.serpapi_api_key},
-            "vision": {"VISION_API_KEY": self.vision_api_key},
             "s3": {"S3_BUCKET": self.s3_bucket},
             "aws": {"AWS_REGION or AWS_DEFAULT_REGION": self.aws_region},
         }
         return [name for name, value in required.get(feature, {}).items() if not value]
+
+    def require_global(self) -> None:
+        self.require("huggingface")
 
     def require(self, *features: str) -> None:
         missing: list[str] = []
@@ -111,9 +115,10 @@ class AppConfig:
         return {
             "sender_email": "set" if self.sender_email else "missing",
             "email_password": "set" if self.email_password else "missing",
-            "cohere_api_key": "set" if self.cohere_api_key else "missing",
+            "hf_token": "set" if self.hf_token else "missing",
+            "hf_text_model": self.hf_text_model,
+            "hf_vision_model": self.hf_vision_model,
             "serpapi_api_key": "set" if self.serpapi_api_key else "missing",
-            "vision_api_key": "set" if self.vision_api_key else "missing",
             "s3_bucket": self.s3_bucket,
             "aws_region": self.aws_region or "missing",
             "ec2_ami_id": self.ec2_ami_id,
@@ -271,51 +276,80 @@ def search_serpapi(config: AppConfig, query: str) -> dict[str, Any]:
     return response.json()
 
 
-def generate_text_with_cohere(config: AppConfig, prompt: str, max_tokens: int = 120) -> str:
-    config.require("cohere")
-    cohere = optional_import("cohere")
-    client = cohere.Client(config.cohere_api_key)
-    response = client.generate(
-        model="command-light-nightly",
-        prompt=prompt,
-        max_tokens=max_tokens,
-        temperature=0.75,
-    )
-    return response.generations[0].text.strip()
+def huggingface_client(config: AppConfig, model: str) -> Any:
+    config.require("huggingface")
+    huggingface_hub = optional_import("huggingface_hub")
+    return huggingface_hub.InferenceClient(model=model, api_key=config.hf_token)
+
+
+def extract_hf_text(response: Any) -> str:
+    if isinstance(response, str):
+        return response.strip()
+    if isinstance(response, list) and response:
+        return extract_hf_text(response[0])
+    if isinstance(response, dict):
+        for key in ("generated_text", "summary_text", "text"):
+            if response.get(key):
+                return str(response[key]).strip()
+        choices = response.get("choices")
+        if choices:
+            return extract_hf_text(choices[0])
+        message = response.get("message")
+        if message:
+            return extract_hf_text(message)
+        content = response.get("content")
+        if content:
+            return str(content).strip()
+
+    choices = getattr(response, "choices", None)
+    if choices:
+        first = choices[0]
+        message = getattr(first, "message", None)
+        if message is not None:
+            content = getattr(message, "content", None)
+            if content:
+                return str(content).strip()
+        text = getattr(first, "text", None)
+        if text:
+            return str(text).strip()
+
+    generated_text = getattr(response, "generated_text", None)
+    if generated_text:
+        return str(generated_text).strip()
+    raise RuntimeError("Hugging Face returned an unsupported response shape.")
+
+
+def generate_text_with_huggingface(
+    config: AppConfig,
+    prompt: str,
+    max_tokens: int = 160,
+) -> str:
+    client = huggingface_client(config, config.hf_text_model)
+    messages = [
+        {
+            "role": "system",
+            "content": "You write concise, practical summaries for developer tooling demos.",
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+    if hasattr(client, "chat_completion"):
+        response = client.chat_completion(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.4,
+        )
+    else:
+        response = client.text_generation(prompt, max_new_tokens=max_tokens)
+    return extract_hf_text(response)
 
 
 def describe_image(config: AppConfig, image_path: str) -> str:
-    config.require("vision", "cohere")
-    requests = optional_import("requests")
+    client = huggingface_client(config, config.hf_vision_model)
     with io.open(image_path, "rb") as image_file:
-        encoded_image = base64.b64encode(image_file.read()).decode("utf-8")
-
-    response = requests.post(
-        f"https://vision.googleapis.com/v1/images:annotate?key={config.vision_api_key}",
-        json={
-            "requests": [
-                {
-                    "image": {"content": encoded_image},
-                    "features": [{"type": "LABEL_DETECTION", "maxResults": 10}],
-                }
-            ]
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if "error" in payload:
-        raise RuntimeError(payload["error"].get("message", "Google Vision API error"))
-
-    labels = [
-        label["description"]
-        for label in payload.get("responses", [{}])[0].get("labelAnnotations", [])
-    ]
-    if not labels:
-        return "No labels detected."
-
-    prompt = f"Based on these image labels, write a concise summary: {', '.join(labels)}"
-    return generate_text_with_cohere(config, prompt)
+        image_bytes = image_file.read()
+    response = client.image_to_text(image_bytes)
+    return extract_hf_text(response)
 
 
 def search_and_generate(config: AppConfig, query: str) -> str:
@@ -329,7 +363,7 @@ def search_and_generate(config: AppConfig, query: str) -> str:
         return "No search snippets were returned."
 
     prompt = "Based on the following information, write a concise summary:\n\n"
-    return generate_text_with_cohere(config, prompt + "\n".join(snippets), max_tokens=160)
+    return generate_text_with_huggingface(config, prompt + "\n".join(snippets))
 
 
 def open_url(config: AppConfig) -> str:
@@ -344,8 +378,8 @@ def doctor_report(config: AppConfig) -> dict[str, Any]:
         "hand_gestures": [],
         "ec2": ["aws"],
         "s3": ["aws", "s3"],
-        "search_summary": ["serpapi", "cohere"],
-        "image_detection": ["vision", "cohere"],
+        "search_summary": ["huggingface", "serpapi"],
+        "image_detection": ["huggingface"],
     }
     report: dict[str, Any] = {"configuration": config.safe_settings(), "features": {}}
 
@@ -366,6 +400,63 @@ def doctor_report(config: AppConfig) -> dict[str, Any]:
         }
 
     return report
+
+
+def build_demo_report(
+    config: AppConfig,
+    query: str | None = None,
+    image_path: str | None = None,
+    include_cloud_status: bool = True,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "configuration": config.safe_settings(),
+        "doctor": doctor_report(config),
+        "outputs": {},
+    }
+
+    if include_cloud_status:
+        try:
+            report["outputs"]["s3_objects"] = list_s3_objects(
+                config,
+                prefix="devto-demo/",
+                limit=10,
+            )
+        except Exception as exc:
+            report["outputs"]["s3_objects_error"] = str(exc)
+
+        try:
+            report["outputs"]["ec2_instances"] = list_ec2_instances(config)
+        except Exception as exc:
+            report["outputs"]["ec2_instances_error"] = str(exc)
+
+    if query:
+        try:
+            report["outputs"]["search_summary"] = {
+                "query": query,
+                "summary": search_and_generate(config, query),
+            }
+        except Exception as exc:
+            report["outputs"]["search_summary_error"] = str(exc)
+
+    if image_path:
+        try:
+            report["outputs"]["image_description"] = {
+                "image": Path(image_path).name,
+                "description": describe_image(config, image_path),
+            }
+        except Exception as exc:
+            report["outputs"]["image_description_error"] = str(exc)
+
+    return report
+
+
+def write_demo_report(config: AppConfig, output_path: str, query: str | None = None) -> str:
+    report = build_demo_report(config, query=query)
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return str(destination)
 
 
 def launch_gui(config: AppConfig) -> None:
@@ -443,33 +534,71 @@ def launch_gui(config: AppConfig) -> None:
             raise ValueError("Image path is required.")
         return describe_image(config, image_path)
 
-    buttons = [
-        ("Doctor Report", lambda: doctor_report(config)),
-        ("Check Configuration", lambda: config.safe_settings()),
-        ("Send Email", email_action),
-        ("Get Location Info", get_location_info),
-        ("Capture Hand Gestures", capture_hand_gestures),
-        ("List EC2 Instances", lambda: list_ec2_instances(config)),
-        ("Stop EC2 Instance", stop_instance_action),
-        ("Launch EC2 Instance", lambda: launch_instance(config)),
-        ("Open URL", lambda: open_url(config)),
-        ("Upload to S3", upload_action),
-        ("List S3 Objects", list_s3_action),
-        ("Download from S3", download_action),
-        ("Delete from S3", delete_action),
-        ("Search Summary Chatbot", chatbot_action),
-        ("Image Detection", image_action),
+    def demo_report_action() -> str:
+        output_path = filedialog.asksaveasfilename(
+            initialfile="python-toolkit-demo-report.json",
+            defaultextension=".json",
+        )
+        if not output_path:
+            raise ValueError("Output path is required.")
+        query = simpledialog.askstring(
+            "Demo Query",
+            "Enter a search query for the demo report:",
+            initialvalue="how automation dashboards help technical training",
+        )
+        return write_demo_report(config, output_path, query=query)
+
+    groups = [
+        (
+            "Demo",
+            [
+                ("Doctor Report", lambda: doctor_report(config)),
+                ("Check Configuration", lambda: config.safe_settings()),
+                ("Export Demo Report", demo_report_action),
+            ],
+        ),
+        (
+            "AI Tools",
+            [
+                ("Search Summary", chatbot_action),
+                ("Image Detection", image_action),
+            ],
+        ),
+        (
+            "AWS",
+            [
+                ("List EC2 Instances", lambda: list_ec2_instances(config)),
+                ("Stop EC2 Instance", stop_instance_action),
+                ("Launch EC2 Instance", lambda: launch_instance(config)),
+                ("Upload to S3", upload_action),
+                ("List S3 Objects", list_s3_action),
+                ("Download from S3", download_action),
+                ("Delete from S3", delete_action),
+            ],
+        ),
+        (
+            "Training Helpers",
+            [
+                ("Send Email", email_action),
+                ("Get Location Info", get_location_info),
+                ("Capture Hand Gestures", capture_hand_gestures),
+                ("Open URL", lambda: open_url(config)),
+            ],
+        ),
     ]
 
-    for text, command in buttons:
-        tk.Button(
-            root,
-            text=text,
-            command=lambda action=command: run_action(action),
-            bg="blue",
-            fg="white",
-            width=28,
-        ).pack(pady=3, padx=10)
+    for group_name, buttons in groups:
+        frame = tk.LabelFrame(root, text=group_name, bg="lightgrey", padx=8, pady=6)
+        frame.pack(fill="x", padx=10, pady=4)
+        for index, (text, command) in enumerate(buttons):
+            tk.Button(
+                frame,
+                text=text,
+                command=lambda action=command: run_action(action),
+                bg="blue",
+                fg="white",
+                width=28,
+            ).grid(row=index // 3, column=index % 3, padx=4, pady=3, sticky="ew")
 
     root.mainloop()
 
@@ -515,6 +644,10 @@ def build_parser() -> argparse.ArgumentParser:
     image = subparsers.add_parser("describe-image", help="Describe an image")
     image.add_argument("image_path")
 
+    demo_report = subparsers.add_parser("demo-report", help="Export a redacted demo report")
+    demo_report.add_argument("output_path")
+    demo_report.add_argument("--query")
+
     return parser
 
 
@@ -545,6 +678,8 @@ def run_cli(args: argparse.Namespace, config: AppConfig) -> Any:
         return search_and_generate(config, args.query)
     if args.command == "describe-image":
         return describe_image(config, args.image_path)
+    if args.command == "demo-report":
+        return write_demo_report(config, args.output_path, query=args.query)
     if args.command == "open-url":
         return open_url(config)
     if args.command == "gui":
@@ -556,6 +691,12 @@ def run_cli(args: argparse.Namespace, config: AppConfig) -> Any:
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     config = AppConfig.from_env()
+    try:
+        config.require_global()
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
     if not argv:
         launch_gui(config)
         return 0
