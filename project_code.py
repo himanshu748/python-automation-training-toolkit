@@ -34,7 +34,7 @@ FEATURE_DEPENDENCIES = {
     "ec2": ["boto3"],
     "s3": ["boto3"],
     "search_summary": ["requests", "huggingface_hub"],
-    "image_detection": ["huggingface_hub"],
+    "image_detection": ["huggingface_hub", "requests"],
 }
 
 
@@ -63,8 +63,8 @@ class AppConfig:
     sender_email: str | None = None
     email_password: str | None = None
     hf_token: str | None = None
-    hf_text_model: str = "HuggingFaceH4/zephyr-7b-beta"
-    hf_vision_model: str = "Salesforce/blip-image-captioning-large"
+    hf_text_model: str = "Qwen/Qwen2.5-1.5B-Instruct"
+    hf_vision_model: str = "Salesforce/blip-image-captioning-base"
     serpapi_api_key: str | None = None
     s3_bucket: str = "dossttpprojectbucket"
     aws_region: str | None = None
@@ -344,12 +344,35 @@ def generate_text_with_huggingface(
     return extract_hf_text(response)
 
 
+def image_to_text_with_inference_api(
+    config: AppConfig,
+    image_bytes: bytes,
+) -> str:
+    config.require("huggingface")
+    requests = optional_import("requests")
+    response = requests.post(
+        f"https://api-inference.huggingface.co/models/{config.hf_vision_model}",
+        headers={"Authorization": f"Bearer {config.hf_token}"},
+        data=image_bytes,
+        timeout=60,
+    )
+    response.raise_for_status()
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = response.text
+    return extract_hf_text(payload)
+
+
 def describe_image(config: AppConfig, image_path: str) -> str:
     client = huggingface_client(config, config.hf_vision_model)
     with io.open(image_path, "rb") as image_file:
         image_bytes = image_file.read()
-    response = client.image_to_text(image_bytes)
-    return extract_hf_text(response)
+    try:
+        response = client.image_to_text(image_bytes)
+        return extract_hf_text(response)
+    except Exception:
+        return image_to_text_with_inference_api(config, image_bytes)
 
 
 def search_and_generate(config: AppConfig, query: str) -> str:

@@ -186,6 +186,49 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(result, "a dashboard screenshot")
         huggingface_client.assert_called_once_with(config, "org/vision-model")
 
+    @patch("project_code.optional_import")
+    @patch("project_code.huggingface_client")
+    def test_describe_image_falls_back_to_direct_inference_api(
+        self,
+        huggingface_client,
+        optional_import,
+    ):
+        client = huggingface_client.return_value
+        client.image_to_text.side_effect = StopIteration()
+        response = type(
+            "Response",
+            (),
+            {
+                "raise_for_status": lambda self: None,
+                "json": lambda self: [{"generated_text": "a local demo image"}],
+            },
+        )()
+        requests = type(
+            "Requests",
+            (),
+            {"post": unittest.mock.Mock(return_value=response)},
+        )()
+        optional_import.return_value = requests
+        config = project_code.AppConfig(
+            hf_token="hf-token",
+            hf_vision_model="org/vision-model",
+        )
+        with tempfile.NamedTemporaryFile(suffix=".png") as image_file:
+            image_file.write(b"fake-image")
+            image_file.flush()
+
+            result = project_code.describe_image(config, image_file.name)
+
+        self.assertEqual(result, "a local demo image")
+        requests.post.assert_called_once()
+        request_url = requests.post.call_args.args[0]
+        request_headers = requests.post.call_args.kwargs["headers"]
+        self.assertEqual(
+            request_url,
+            "https://api-inference.huggingface.co/models/org/vision-model",
+        )
+        self.assertEqual(request_headers["Authorization"], "Bearer hf-token")
+
     @patch("project_code.search_and_generate")
     @patch("project_code.list_ec2_instances")
     @patch("project_code.list_s3_objects")

@@ -52,9 +52,14 @@ Minimum required model configuration:
 
 ```bash
 export HF_TOKEN="hf_..."
-export HF_TEXT_MODEL="HuggingFaceH4/zephyr-7b-beta"
-export HF_VISION_MODEL="Salesforce/blip-image-captioning-large"
+export HF_TEXT_MODEL="Qwen/Qwen2.5-1.5B-Instruct"
+export HF_VISION_MODEL="Salesforce/blip-image-captioning-base"
 ```
+
+The text default is a hosted chat model that works well for concise demo
+summaries. Image captions use Hugging Face's `InferenceClient` first and fall
+back to the direct model inference endpoint when provider routing does not
+support the configured vision model.
 
 Search summaries need SerpAPI:
 
@@ -187,8 +192,8 @@ python -m unittest discover -s tests
 | Variable | Used For |
 | --- | --- |
 | `HF_TOKEN` | Required Hugging Face hosted inference token |
-| `HF_TEXT_MODEL` | Hugging Face text/chat model for summaries |
-| `HF_VISION_MODEL` | Hugging Face image captioning model |
+| `HF_TEXT_MODEL` | Hugging Face text/chat model for summaries, default `Qwen/Qwen2.5-1.5B-Instruct` |
+| `HF_VISION_MODEL` | Hugging Face image captioning model, default `Salesforce/blip-image-captioning-base` |
 | `SERPAPI_API_KEY` | Search-backed chatbot summaries |
 | `AWS_REGION` or `AWS_DEFAULT_REGION` | AWS client region |
 | `S3_BUCKET` | Default S3 bucket |
