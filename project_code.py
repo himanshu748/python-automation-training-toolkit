@@ -2,8 +2,9 @@
 
 The original project was a single Tkinter script that mixed GUI code,
 credentials, cloud calls, and optional computer-vision dependencies at import
-time. This version keeps the GUI, adds a CLI, and loads external services only
-when a user runs the matching tool.
+time. This version keeps the GUI as the primary experience, adds optional
+command-line helpers for testing and automation, and loads external services
+only when a user runs the matching tool.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import importlib
+import importlib.util
 import io
 import json
 import os
@@ -23,6 +25,24 @@ from typing import Any
 
 class ConfigError(RuntimeError):
     """Raised when a requested tool is missing required configuration."""
+
+
+FEATURE_DEPENDENCIES = {
+    "email": ["pywhatkit"],
+    "location": ["geocoder"],
+    "hand_gestures": ["cv2", "cvzone.HandTrackingModule"],
+    "ec2": ["boto3"],
+    "s3": ["boto3"],
+    "search_summary": ["requests", "cohere"],
+    "image_detection": ["requests", "cohere"],
+}
+
+
+def dependency_installed(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except ModuleNotFoundError:
+        return False
 
 
 def optional_import(module_name: str, package_name: str | None = None) -> Any:
@@ -215,6 +235,30 @@ def delete_from_s3(config: AppConfig, key: str) -> str:
     return f"Deleted s3://{config.s3_bucket}/{key}"
 
 
+def list_s3_objects(
+    config: AppConfig,
+    prefix: str = "",
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    config.require("s3")
+    s3_client = boto3_client("s3", config)
+    response = s3_client.list_objects_v2(
+        Bucket=config.s3_bucket,
+        Prefix=prefix,
+        MaxKeys=limit,
+    )
+    return [
+        {
+            "key": item["Key"],
+            "size": item.get("Size", 0),
+            "last_modified": item.get("LastModified", "").isoformat()
+            if hasattr(item.get("LastModified"), "isoformat")
+            else str(item.get("LastModified", "")),
+        }
+        for item in response.get("Contents", [])
+    ]
+
+
 def search_serpapi(config: AppConfig, query: str) -> dict[str, Any]:
     config.require("serpapi")
     requests = optional_import("requests")
@@ -293,6 +337,37 @@ def open_url(config: AppConfig) -> str:
     return f"Opened {config.external_url}"
 
 
+def doctor_report(config: AppConfig) -> dict[str, Any]:
+    feature_requirements = {
+        "email": ["email"],
+        "location": [],
+        "hand_gestures": [],
+        "ec2": ["aws"],
+        "s3": ["aws", "s3"],
+        "search_summary": ["serpapi", "cohere"],
+        "image_detection": ["vision", "cohere"],
+    }
+    report: dict[str, Any] = {"configuration": config.safe_settings(), "features": {}}
+
+    for feature, config_features in feature_requirements.items():
+        missing_config: list[str] = []
+        for config_feature in config_features:
+            missing_config.extend(config.missing_for(config_feature))
+
+        missing_dependencies = [
+            dependency
+            for dependency in FEATURE_DEPENDENCIES.get(feature, [])
+            if not dependency_installed(dependency)
+        ]
+        report["features"][feature] = {
+            "ready": not missing_config and not missing_dependencies,
+            "missing_config": missing_config,
+            "missing_dependencies": missing_dependencies,
+        }
+
+    return report
+
+
 def launch_gui(config: AppConfig) -> None:
     import tkinter as tk
     from tkinter import filedialog, messagebox, scrolledtext, simpledialog
@@ -350,6 +425,10 @@ def launch_gui(config: AppConfig) -> None:
             raise ValueError("S3 key is required.")
         return delete_from_s3(config, key)
 
+    def list_s3_action() -> list[dict[str, Any]]:
+        prefix = simpledialog.askstring("S3 Prefix", "Enter a prefix filter:") or ""
+        return list_s3_objects(config, prefix=prefix)
+
     def chatbot_action() -> str:
         query = simpledialog.askstring("Search Summary", "Enter your query:")
         if not query:
@@ -365,6 +444,7 @@ def launch_gui(config: AppConfig) -> None:
         return describe_image(config, image_path)
 
     buttons = [
+        ("Doctor Report", lambda: doctor_report(config)),
         ("Check Configuration", lambda: config.safe_settings()),
         ("Send Email", email_action),
         ("Get Location Info", get_location_info),
@@ -374,6 +454,7 @@ def launch_gui(config: AppConfig) -> None:
         ("Launch EC2 Instance", lambda: launch_instance(config)),
         ("Open URL", lambda: open_url(config)),
         ("Upload to S3", upload_action),
+        ("List S3 Objects", list_s3_action),
         ("Download from S3", download_action),
         ("Delete from S3", delete_action),
         ("Search Summary Chatbot", chatbot_action),
@@ -398,9 +479,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser("check-config", help="Show non-secret configuration status")
+    subparsers.add_parser("doctor", help="Check feature readiness")
     subparsers.add_parser("location", help="Show location inferred from current IP")
     subparsers.add_parser("list-ec2", help="List EC2 instances")
     subparsers.add_parser("launch-ec2", help="Launch an EC2 instance")
+    subparsers.add_parser("open-url", help="Open the configured external URL")
     subparsers.add_parser("gui", help="Open the Tkinter dashboard")
 
     stop_ec2 = subparsers.add_parser("stop-ec2", help="Stop one EC2 instance")
@@ -414,6 +497,10 @@ def build_parser() -> argparse.ArgumentParser:
     upload = subparsers.add_parser("upload-s3", help="Upload a file to S3")
     upload.add_argument("file_path")
     upload.add_argument("key")
+
+    list_s3 = subparsers.add_parser("list-s3", help="List objects in the configured S3 bucket")
+    list_s3.add_argument("--prefix", default="")
+    list_s3.add_argument("--limit", type=int, default=20)
 
     download = subparsers.add_parser("download-s3", help="Download a file from S3")
     download.add_argument("key")
@@ -434,6 +521,8 @@ def build_parser() -> argparse.ArgumentParser:
 def run_cli(args: argparse.Namespace, config: AppConfig) -> Any:
     if args.command == "check-config":
         return config.safe_settings()
+    if args.command == "doctor":
+        return doctor_report(config)
     if args.command == "location":
         return get_location_info()
     if args.command == "list-ec2":
@@ -446,6 +535,8 @@ def run_cli(args: argparse.Namespace, config: AppConfig) -> Any:
         return send_email(config, args.receiver, args.message, args.subject)
     if args.command == "upload-s3":
         return upload_to_s3(config, args.file_path, args.key)
+    if args.command == "list-s3":
+        return list_s3_objects(config, args.prefix, args.limit)
     if args.command == "download-s3":
         return download_from_s3(config, args.key, args.destination)
     if args.command == "delete-s3":
@@ -454,6 +545,8 @@ def run_cli(args: argparse.Namespace, config: AppConfig) -> Any:
         return search_and_generate(config, args.query)
     if args.command == "describe-image":
         return describe_image(config, args.image_path)
+    if args.command == "open-url":
+        return open_url(config)
     if args.command == "gui":
         launch_gui(config)
         return None
