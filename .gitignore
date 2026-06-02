@@ -5,3 +5,5 @@ __pycache__/
 .DS_Store
 submission/video/*silent.mp4
 submission/video/*.wav
+submission/
+scripts/create_submission_assets.py
