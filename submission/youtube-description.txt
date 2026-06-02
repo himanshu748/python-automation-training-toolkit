@@ -1,0 +1,18 @@
+Python Automation Training Toolkit turns an abandoned Python automation script into a browser-first workspace for real workflows.
+
+What the walkthrough shows:
+- Readiness and safe configuration status
+- Hugging Face text summaries and image captions
+- Separate AWS EC2 and S3 controls
+- Browser-native live hand gesture tracking with MediaPipe
+- Location utilities, CLI/API support, tests, and docs
+
+Built for the DEV GitHub Finish-Up-A-Thon Challenge.
+
+Repository:
+https://github.com/himanshu748/python-automation-training-toolkit
+
+Local run:
+python project_code.py
+
+#devchallenge #githubchallenge #python #huggingface #automation

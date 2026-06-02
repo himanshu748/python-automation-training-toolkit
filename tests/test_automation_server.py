@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-import project_code
+from apps.api import automation_server as project_code
 
 
 class ConfigTests(unittest.TestCase):
@@ -15,7 +15,6 @@ class ConfigTests(unittest.TestCase):
             "HF_TOKEN": "hf-secret",
             "HF_TEXT_MODEL": "test/text-model",
             "HF_VISION_MODEL": "test/vision-model",
-            "SERPAPI_API_KEY": "serp-secret",
             "AWS_REGION": "ap-south-1",
             "S3_BUCKET": "training-bucket",
         }
@@ -63,7 +62,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result["hf_token"], "missing")
         self.assertEqual(result["email_password"], "missing")
 
-    def test_doctor_command_reports_missing_config_by_feature(self):
+    def test_doctor_command_returns_missing_config_by_feature(self):
         config = project_code.AppConfig()
         args = project_code.build_parser().parse_args(["doctor"])
 
@@ -74,16 +73,29 @@ class CliTests(unittest.TestCase):
         self.assertIn("SENDER_EMAIL", result["features"]["email"]["missing_config"])
         self.assertIn("HF_TOKEN", result["features"]["search_summary"]["missing_config"])
 
-    @patch("project_code.open_url")
-    def test_open_url_command_dispatches_to_feature(self, open_url):
-        open_url.return_value = "Opened https://example.com"
-        config = project_code.AppConfig(external_url="https://example.com")
-        args = project_code.build_parser().parse_args(["open-url"])
+    @patch("apps.api.automation_server.launch_tailwind_dashboard")
+    def test_web_command_launches_tailwind_dashboard(self, launch_tailwind_dashboard):
+        config = project_code.AppConfig(hf_token="hf-token")
+        args = project_code.build_parser().parse_args(
+            [
+                "web",
+                "--server-name",
+                "0.0.0.0",
+                "--server-port",
+                "7861",
+                "--no-browser",
+            ]
+        )
 
         result = project_code.run_cli(args, config)
 
-        self.assertEqual(result, "Opened https://example.com")
-        open_url.assert_called_once_with(config)
+        self.assertIsNone(result)
+        launch_tailwind_dashboard.assert_called_once_with(
+            config,
+            server_name="0.0.0.0",
+            server_port=7861,
+            inbrowser=False,
+        )
 
 
 class FeatureTests(unittest.TestCase):
@@ -93,13 +105,20 @@ class FeatureTests(unittest.TestCase):
 
         self.assertIn("pip install", str(caught.exception))
 
-    @patch("project_code.boto3_client")
+    def test_tailwind_handler_is_available_for_web_dashboard(self):
+        config = project_code.AppConfig(hf_token="hf-token")
+
+        handler = project_code.build_tailwind_handler(config)
+
+        self.assertTrue(issubclass(handler, project_code.http.server.BaseHTTPRequestHandler))
+
+    @patch("apps.api.automation_server.boto3_client")
     def test_list_s3_objects_returns_small_serializable_records(self, boto3_client):
         client = boto3_client.return_value
         client.list_objects_v2.return_value = {
             "Contents": [
                 {
-                    "Key": "reports/report.pdf",
+                    "Key": "training-runs/artifact.txt",
                     "Size": 1234,
                     "LastModified": datetime(2026, 6, 2, tzinfo=timezone.utc),
                 }
@@ -107,53 +126,40 @@ class FeatureTests(unittest.TestCase):
         }
         config = project_code.AppConfig(aws_region="ap-south-1", s3_bucket="training")
 
-        result = project_code.list_s3_objects(config, prefix="reports/", limit=5)
+        result = project_code.list_s3_objects(config, prefix="training-runs/", limit=5)
 
         client.list_objects_v2.assert_called_once_with(
             Bucket="training",
-            Prefix="reports/",
+            Prefix="training-runs/",
             MaxKeys=5,
         )
         self.assertEqual(
             result,
             [
                 {
-                    "key": "reports/report.pdf",
+                    "key": "training-runs/artifact.txt",
                     "size": 1234,
                     "last_modified": "2026-06-02T00:00:00+00:00",
                 }
             ],
         )
 
-    @patch("project_code.generate_text_with_huggingface")
-    @patch("project_code.search_serpapi")
-    def test_search_and_generate_summarizes_only_returned_snippets(
+    @patch("apps.api.automation_server.generate_text_with_huggingface")
+    def test_search_and_generate_uses_huggingface_directly(
         self,
-        search_serpapi,
         generate_text_with_huggingface,
     ):
-        config = project_code.AppConfig(
-            hf_token="hf-token",
-            serpapi_api_key="serpapi",
-        )
-        search_serpapi.return_value = {
-            "organic_results": [
-                {"snippet": "First useful result."},
-                {"title": "No snippet"},
-                {"snippet": "Second useful result."},
-            ]
-        }
+        config = project_code.AppConfig(hf_token="hf-token")
         generate_text_with_huggingface.return_value = "A concise summary."
 
         result = project_code.search_and_generate(config, "training automation")
 
         self.assertEqual(result, "A concise summary.")
         prompt = generate_text_with_huggingface.call_args.args[1]
-        self.assertIn("First useful result.", prompt)
-        self.assertIn("Second useful result.", prompt)
-        self.assertNotIn("No snippet", prompt)
+        self.assertIn("training automation", prompt)
+        self.assertIn("avoid pretending to browse", prompt)
 
-    @patch("project_code.huggingface_client")
+    @patch("apps.api.automation_server.huggingface_client")
     def test_generate_text_with_huggingface_uses_configured_model(self, huggingface_client):
         client = huggingface_client.return_value
         client.chat_completion.return_value = {
@@ -169,7 +175,7 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(result, "HF summary")
         huggingface_client.assert_called_once_with(config, "org/text-model")
 
-    @patch("project_code.huggingface_client")
+    @patch("apps.api.automation_server.huggingface_client")
     def test_describe_image_uses_huggingface_vision_model(self, huggingface_client):
         client = huggingface_client.return_value
         client.image_to_text.return_value = [{"generated_text": "a dashboard screenshot"}]
@@ -186,8 +192,8 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(result, "a dashboard screenshot")
         huggingface_client.assert_called_once_with(config, "org/vision-model")
 
-    @patch("project_code.optional_import")
-    @patch("project_code.huggingface_client")
+    @patch("apps.api.automation_server.optional_import")
+    @patch("apps.api.automation_server.huggingface_client")
     def test_describe_image_falls_back_to_direct_inference_api(
         self,
         huggingface_client,
@@ -200,7 +206,7 @@ class FeatureTests(unittest.TestCase):
             (),
             {
                 "raise_for_status": lambda self: None,
-                "json": lambda self: [{"generated_text": "a local demo image"}],
+                "json": lambda self: [{"generated_text": "a local training image"}],
             },
         )()
         requests = type(
@@ -219,7 +225,7 @@ class FeatureTests(unittest.TestCase):
 
             result = project_code.describe_image(config, image_file.name)
 
-        self.assertEqual(result, "a local demo image")
+        self.assertEqual(result, "a local training image")
         requests.post.assert_called_once()
         request_url = requests.post.call_args.args[0]
         request_headers = requests.post.call_args.kwargs["headers"]
@@ -228,32 +234,6 @@ class FeatureTests(unittest.TestCase):
             "https://api-inference.huggingface.co/models/org/vision-model",
         )
         self.assertEqual(request_headers["Authorization"], "Bearer hf-token")
-
-    @patch("project_code.search_and_generate")
-    @patch("project_code.list_ec2_instances")
-    @patch("project_code.list_s3_objects")
-    def test_demo_report_redacts_secrets(
-        self,
-        list_s3_objects,
-        list_ec2_instances,
-        search_and_generate,
-    ):
-        list_s3_objects.return_value = [{"key": "devto-demo/report.txt", "size": 12}]
-        list_ec2_instances.return_value = [{"id": "i-123", "state": "running"}]
-        search_and_generate.return_value = "Demo summary"
-        config = project_code.AppConfig(
-            hf_token="hf-secret",
-            serpapi_api_key="serp-secret",
-            aws_region="ap-south-1",
-            s3_bucket="training",
-        )
-
-        report = project_code.build_demo_report(config, query="demo query")
-
-        report_text = str(report)
-        self.assertIn("Demo summary", report_text)
-        self.assertNotIn("hf-secret", report_text)
-        self.assertNotIn("serp-secret", report_text)
 
     def test_main_fails_without_global_hf_token(self):
         with patch.dict(os.environ, {}, clear=True), patch("sys.stderr"):
