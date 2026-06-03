@@ -29,6 +29,10 @@ class ConfigError(RuntimeError):
     """Raised when a requested tool is missing required configuration."""
 
 
+class RequestError(RuntimeError):
+    """Raised when a local HTTP request is malformed."""
+
+
 FEATURE_DEPENDENCIES = {
     "email": ["pywhatkit"],
     "location": ["geocoder", "requests"],
@@ -40,6 +44,9 @@ FEATURE_DEPENDENCIES = {
 }
 
 DEFAULT_S3_PREFIX = "training-runs/"
+MAX_JSON_BODY_BYTES = 1_000_000
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+IMAGE_SUFFIXES = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WEB_APP_DIR = REPO_ROOT / "apps" / "web"
 PAGES_DIR = WEB_APP_DIR / "pages"
@@ -306,6 +313,7 @@ def list_s3_objects(
     prefix: str = "",
     limit: int = 20,
 ) -> list[dict[str, Any]]:
+    limit = bounded_int(limit, "limit", minimum=1, maximum=100)
     config.require("s3")
     s3_client = boto3_client("s3", config)
     response = s3_client.list_objects_v2(
@@ -413,9 +421,26 @@ def image_to_text_with_inference_api(
     return extract_hf_text(payload)
 
 
+def validate_local_image_path(image_path: str) -> Path:
+    if not image_path.strip():
+        raise ValueError("Image path is required.")
+    path = Path(image_path).expanduser().resolve()
+    if not path.exists():
+        raise ValueError(f"Image file does not exist: {image_path}")
+    if not path.is_file():
+        raise ValueError(f"Image path must be a file: {image_path}")
+    if path.suffix.lower() not in IMAGE_SUFFIXES:
+        allowed = ", ".join(sorted(IMAGE_SUFFIXES))
+        raise ValueError(f"Image file must use one of these extensions: {allowed}")
+    if path.stat().st_size > MAX_IMAGE_BYTES:
+        raise ValueError(f"Image file must be {MAX_IMAGE_BYTES} bytes or smaller.")
+    return path
+
+
 def describe_image(config: AppConfig, image_path: str) -> str:
+    validated_path = validate_local_image_path(image_path)
     client = huggingface_client(config, config.hf_vision_model)
-    with io.open(image_path, "rb") as image_file:
+    with io.open(validated_path, "rb") as image_file:
         image_bytes = image_file.read()
     try:
         response = client.image_to_text(image_bytes)
@@ -474,12 +499,46 @@ def result_payload(action: Any) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
 
 
+def bounded_int(value: Any, name: str, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer.") from exc
+    if parsed < minimum or parsed > maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}.")
+    return parsed
+
+
+def path_within_directory(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def parse_request_json(handler: http.server.BaseHTTPRequestHandler) -> dict[str, Any]:
-    length = int(handler.headers.get("Content-Length", "0") or 0)
+    raw_length = handler.headers.get("Content-Length", "0") or "0"
+    try:
+        length = int(raw_length)
+    except ValueError as exc:
+        raise RequestError("Content-Length must be an integer.") from exc
+    if length < 0:
+        raise RequestError("Content-Length must be positive.")
+    if length > MAX_JSON_BODY_BYTES:
+        raise RequestError(f"JSON body must be {MAX_JSON_BODY_BYTES} bytes or smaller.")
     if not length:
         return {}
-    body = handler.rfile.read(length).decode("utf-8")
-    return json.loads(body or "{}")
+    try:
+        body = handler.rfile.read(length).decode("utf-8")
+        payload = json.loads(body or "{}")
+    except UnicodeDecodeError as exc:
+        raise RequestError("JSON body must be UTF-8.") from exc
+    except json.JSONDecodeError as exc:
+        raise RequestError("JSON body is invalid.") from exc
+    if not isinstance(payload, dict):
+        raise RequestError("JSON body must be an object.")
+    return payload
 
 
 def json_response(
@@ -526,7 +585,7 @@ def build_tailwind_handler(config: AppConfig) -> type[http.server.BaseHTTPReques
                 elif url.path == "/api/list-s3":
                     params = urllib.parse.parse_qs(url.query)
                     prefix = params.get("prefix", [DEFAULT_S3_PREFIX])[0]
-                    limit = int(params.get("limit", ["10"])[0] or 10)
+                    limit = bounded_int(params.get("limit", ["10"])[0] or 10, "limit", minimum=1, maximum=100)
                     json_response(
                         self,
                         result_payload(lambda: list_s3_objects(config, prefix, limit)),
@@ -535,6 +594,8 @@ def build_tailwind_handler(config: AppConfig) -> type[http.server.BaseHTTPReques
                     json_response(self, result_payload(get_location_info))
                 else:
                     json_response(self, {"error": "Not found"}, status=404)
+            except (RequestError, ValueError) as exc:
+                json_response(self, {"error": str(exc)}, status=400)
             except Exception as exc:
                 json_response(self, {"error": str(exc)}, status=500)
 
@@ -550,8 +611,6 @@ def build_tailwind_handler(config: AppConfig) -> type[http.server.BaseHTTPReques
                     )
                 elif url.path == "/api/describe-image":
                     image_path = str(payload.get("image_path", "")).strip()
-                    if not image_path:
-                        raise ValueError("Image path is required.")
                     json_response(
                         self,
                         result_payload(lambda: describe_image(config, image_path)),
@@ -597,6 +656,8 @@ def build_tailwind_handler(config: AppConfig) -> type[http.server.BaseHTTPReques
                     )
                 else:
                     json_response(self, {"error": "Not found"}, status=404)
+            except (RequestError, ValueError) as exc:
+                json_response(self, {"error": str(exc)}, status=400)
             except Exception as exc:
                 json_response(self, {"error": str(exc)}, status=500)
 
@@ -604,8 +665,13 @@ def build_tailwind_handler(config: AppConfig) -> type[http.server.BaseHTTPReques
             self.serve_file(PAGES_DIR / filename, "text/html; charset=utf-8")
 
         def serve_static_asset(self, filename: str) -> None:
-            asset_path = (ASSETS_DIR / filename).resolve()
-            if not str(asset_path).startswith(str(ASSETS_DIR.resolve())):
+            try:
+                decoded_filename = urllib.parse.unquote(filename)
+            except UnicodeDecodeError:
+                json_response(self, {"error": "Not found"}, status=404)
+                return
+            asset_path = (ASSETS_DIR / decoded_filename).resolve()
+            if not path_within_directory(asset_path, ASSETS_DIR):
                 json_response(self, {"error": "Not found"}, status=404)
                 return
             content_type = "application/javascript; charset=utf-8"
@@ -735,11 +801,6 @@ def run_cli(args: argparse.Namespace, config: AppConfig) -> Any:
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     config = AppConfig.from_env()
-    try:
-        config.require_global()
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
 
     if not argv:
         launch_tailwind_dashboard(config)

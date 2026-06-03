@@ -168,6 +168,20 @@ function bind(id, eventName, handler) {
   if (element) element.addEventListener(eventName, handler);
 }
 
+async function runOutputAction(outputId, loadingMessage, action, kind = "default") {
+  const output = $(outputId);
+  if (!output) return;
+  output.textContent = loadingMessage;
+  try {
+    const payload = await action();
+    output.textContent = formatResult(payload, kind);
+  } catch (error) {
+    const message = error && error.message ? error.message : "Request failed";
+    output.textContent = `Status: failed\n\n${message}`;
+    log("Workflow failed", message, "red");
+  }
+}
+
 function bindOverviewPage() {
   bind("refresh-btn", "click", () => refreshHealth().catch((error) => log("Refresh failed", error.message, "red")));
   bind("clear-log", "click", () => {
@@ -177,82 +191,87 @@ function bindOverviewPage() {
 }
 
 function bindModelPage() {
-  bind("summary-btn", "click", async () => {
-    $("summary-output").textContent = "Generating summary...";
-    const payload = await api("/api/search-summary", {
+  bind("summary-btn", "click", () => runOutputAction(
+    "summary-output",
+    "Generating summary...",
+    () => api("/api/search-summary", {
       method: "POST",
       body: JSON.stringify({ query: $("summary-query").value }),
-    });
-    $("summary-output").textContent = formatResult(payload, "text");
-  });
-  bind("image-btn", "click", async () => {
-    $("summary-output").textContent = "Captioning image...";
-    const payload = await api("/api/describe-image", {
+    }),
+    "text",
+  ));
+  bind("image-btn", "click", () => runOutputAction(
+    "summary-output",
+    "Captioning image...",
+    () => api("/api/describe-image", {
       method: "POST",
       body: JSON.stringify({ image_path: $("image-path").value }),
-    });
-    $("summary-output").textContent = formatResult(payload, "text");
-  });
+    }),
+    "text",
+  ));
 }
 
 function bindCloudPage() {
-  bind("ec2-btn", "click", async () => {
-    $("cloud-output").textContent = "Loading EC2 instances...";
-    const payload = await api("/api/list-ec2");
-    $("cloud-output").textContent = formatResult(payload);
-  });
-  bind("ec2-launch-btn", "click", async () => {
-    $("cloud-output").textContent = "Launching EC2 instance...";
-    const payload = await api("/api/launch-ec2", { method: "POST", body: "{}" });
-    $("cloud-output").textContent = formatResult(payload);
-  });
-  bind("ec2-stop-btn", "click", async () => {
-    $("cloud-output").textContent = "Stopping EC2 instance...";
-    const payload = await api("/api/stop-ec2", {
+  bind("ec2-btn", "click", () => runOutputAction(
+    "cloud-output",
+    "Loading EC2 instances...",
+    () => api("/api/list-ec2"),
+  ));
+  bind("ec2-launch-btn", "click", () => runOutputAction(
+    "cloud-output",
+    "Launching EC2 instance...",
+    () => api("/api/launch-ec2", { method: "POST", body: "{}" }),
+  ));
+  bind("ec2-stop-btn", "click", () => runOutputAction(
+    "cloud-output",
+    "Stopping EC2 instance...",
+    () => api("/api/stop-ec2", {
       method: "POST",
       body: JSON.stringify({ instance_id: $("instance-id").value }),
-    });
-    $("cloud-output").textContent = formatResult(payload);
-  });
-  bind("s3-btn", "click", async () => {
-    $("cloud-output").textContent = "Loading S3 objects...";
-    const prefix = encodeURIComponent($("s3-prefix").value);
-    const limit = encodeURIComponent($("s3-limit").value || "10");
-    const payload = await api(`/api/list-s3?prefix=${prefix}&limit=${limit}`);
-    $("cloud-output").textContent = formatResult(payload);
-  });
-  bind("s3-upload-btn", "click", async () => {
-    $("cloud-output").textContent = "Uploading S3 object...";
-    const payload = await api("/api/upload-s3", {
+    }),
+  ));
+  bind("s3-btn", "click", () => runOutputAction(
+    "cloud-output",
+    "Loading S3 objects...",
+    () => {
+      const prefix = encodeURIComponent($("s3-prefix").value);
+      const limit = encodeURIComponent($("s3-limit").value || "10");
+      return api(`/api/list-s3?prefix=${prefix}&limit=${limit}`);
+    },
+  ));
+  bind("s3-upload-btn", "click", () => runOutputAction(
+    "cloud-output",
+    "Uploading S3 object...",
+    () => api("/api/upload-s3", {
       method: "POST",
       body: JSON.stringify({ file_path: $("local-file-path").value, key: $("s3-key").value }),
-    });
-    $("cloud-output").textContent = formatResult(payload);
-  });
-  bind("s3-download-btn", "click", async () => {
-    $("cloud-output").textContent = "Downloading S3 object...";
-    const payload = await api("/api/download-s3", {
+    }),
+  ));
+  bind("s3-download-btn", "click", () => runOutputAction(
+    "cloud-output",
+    "Downloading S3 object...",
+    () => api("/api/download-s3", {
       method: "POST",
       body: JSON.stringify({ key: $("s3-key").value, destination: $("download-destination").value }),
-    });
-    $("cloud-output").textContent = formatResult(payload);
-  });
-  bind("s3-delete-btn", "click", async () => {
-    $("cloud-output").textContent = "Deleting S3 object...";
-    const payload = await api("/api/delete-s3", {
+    }),
+  ));
+  bind("s3-delete-btn", "click", () => runOutputAction(
+    "cloud-output",
+    "Deleting S3 object...",
+    () => api("/api/delete-s3", {
       method: "POST",
       body: JSON.stringify({ key: $("s3-key").value }),
-    });
-    $("cloud-output").textContent = formatResult(payload);
-  });
+    }),
+  ));
 }
 
 function bindUtilityPage() {
-  bind("location-btn", "click", async () => {
-    $("utility-output").textContent = "Looking up location...";
-    const payload = await api("/api/location");
-    $("utility-output").textContent = formatResult(payload, "location");
-  });
+  bind("location-btn", "click", () => runOutputAction(
+    "utility-output",
+    "Looking up location...",
+    () => api("/api/location"),
+    "location",
+  ));
 }
 
 document.addEventListener("DOMContentLoaded", () => {

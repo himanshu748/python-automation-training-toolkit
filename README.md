@@ -126,6 +126,10 @@ python project_code.py list-s3 --prefix training-runs/ --limit 10
 
 - Secrets come from environment variables and are displayed only as `set` or
   `missing`.
+- Readiness commands (`doctor`, `check-config`) run without secrets; feature
+  commands fail only when their own required credentials are missing.
+- The web server binds to `127.0.0.1` by default, bounds JSON request bodies,
+  and validates local image paths before sending image bytes to Hugging Face.
 - Use least-privilege credentials for AWS workflows.
 - Scope S3 permissions to the buckets and prefixes your environment needs.
 - Avoid committing `.env`, terminal logs, generated files with sensitive data,

@@ -1,3 +1,4 @@
+import io
 import os
 import tempfile
 import unittest
@@ -144,6 +145,14 @@ class FeatureTests(unittest.TestCase):
             ],
         )
 
+    def test_list_s3_objects_bounds_limit(self):
+        config = project_code.AppConfig(aws_region="ap-south-1", s3_bucket="training")
+
+        with self.assertRaises(ValueError) as caught:
+            project_code.list_s3_objects(config, limit=0)
+
+        self.assertIn("limit must be between 1 and 100", str(caught.exception))
+
     @patch("apps.api.automation_server.generate_text_with_huggingface")
     def test_search_and_generate_uses_huggingface_directly(
         self,
@@ -192,6 +201,17 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(result, "a dashboard screenshot")
         huggingface_client.assert_called_once_with(config, "org/vision-model")
 
+    def test_describe_image_rejects_non_image_extension(self):
+        config = project_code.AppConfig(hf_token="hf-token")
+        with tempfile.NamedTemporaryFile(suffix=".txt") as text_file:
+            text_file.write(b"not-image")
+            text_file.flush()
+
+            with self.assertRaises(ValueError) as caught:
+                project_code.describe_image(config, text_file.name)
+
+        self.assertIn("Image file must use one of these extensions", str(caught.exception))
+
     @patch("apps.api.automation_server.optional_import")
     @patch("apps.api.automation_server.huggingface_client")
     def test_describe_image_falls_back_to_direct_inference_api(
@@ -235,9 +255,35 @@ class FeatureTests(unittest.TestCase):
         )
         self.assertEqual(request_headers["Authorization"], "Bearer hf-token")
 
-    def test_main_fails_without_global_hf_token(self):
+    def test_static_asset_path_helper_rejects_escape(self):
+        root = project_code.ASSETS_DIR
+
+        self.assertTrue(project_code.path_within_directory(root / "app.js", root))
+        self.assertFalse(project_code.path_within_directory(root.parent / "pages" / "landing.html", root))
+
+    def test_parse_request_json_rejects_invalid_json(self):
+        handler = type(
+            "Handler",
+            (),
+            {
+                "headers": {"Content-Length": "5"},
+                "rfile": io.BytesIO(b"{bad}"),
+            },
+        )()
+
+        with self.assertRaises(project_code.RequestError) as caught:
+            project_code.parse_request_json(handler)
+
+        self.assertIn("invalid", str(caught.exception))
+
+    def test_main_allows_readiness_commands_without_hf_token(self):
+        with patch.dict(os.environ, {}, clear=True), patch("sys.stdout"):
+            self.assertEqual(project_code.main(["doctor"]), 0)
+            self.assertEqual(project_code.main(["check-config"]), 0)
+
+    def test_main_keeps_feature_specific_hf_requirement(self):
         with patch.dict(os.environ, {}, clear=True), patch("sys.stderr"):
-            self.assertEqual(project_code.main(["doctor"]), 1)
+            self.assertEqual(project_code.main(["search-summary", "automation"]), 1)
 
 
 if __name__ == "__main__":
