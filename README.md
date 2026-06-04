@@ -129,9 +129,12 @@ python project_code.py list-s3 --prefix training-runs/ --limit 10
 - Readiness commands (`doctor`, `check-config`) run without secrets; feature
   commands fail only when their own required credentials are missing.
 - The web server binds to `127.0.0.1` by default, bounds JSON request bodies,
-  and validates local image paths before sending image bytes to Hugging Face.
+  and validates local image, upload, download, S3 key, and S3 prefix inputs
+  before invoking external services.
 - Use least-privilege credentials for AWS workflows.
 - Scope S3 permissions to the buckets and prefixes your environment needs.
+- Configure `S3_BUCKET` explicitly; the app does not fall back to a shared
+  or personal bucket.
 - Avoid committing `.env`, terminal logs, generated files with sensitive data,
   or screenshots that reveal credentials.
 

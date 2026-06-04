@@ -52,6 +52,8 @@ one-page prototype.
   with live landmarks and gesture labels rendered in the page.
 - Secrets are displayed only as `set` or `missing`.
 - Cloud destructive actions must be visually distinct.
+- S3 and local file workflows must validate keys, prefixes, and local paths
+  before any AWS call runs.
 
 ## Repo Shape
 

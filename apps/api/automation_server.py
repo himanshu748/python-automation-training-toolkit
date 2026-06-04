@@ -46,11 +46,13 @@ FEATURE_DEPENDENCIES = {
 DEFAULT_S3_PREFIX = "training-runs/"
 MAX_JSON_BODY_BYTES = 1_000_000
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_S3_KEY_BYTES = 1_024
 IMAGE_SUFFIXES = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WEB_APP_DIR = REPO_ROOT / "apps" / "web"
 PAGES_DIR = WEB_APP_DIR / "pages"
 ASSETS_DIR = WEB_APP_DIR / "assets"
+LOCAL_WORKSPACE_ROOTS = (REPO_ROOT, Path.cwd().resolve())
 ROUTES = {
     "/": "landing.html",
     "/index.html": "landing.html",
@@ -94,7 +96,7 @@ class AppConfig:
     hf_token: str | None = None
     hf_text_model: str = "Qwen/Qwen2.5-1.5B-Instruct"
     hf_vision_model: str = "Salesforce/blip-image-captioning-base"
-    s3_bucket: str = "dossttpprojectbucket"
+    s3_bucket: str | None = None
     aws_region: str | None = None
     ec2_ami_id: str = "ami-09298640a92b2d12c"
     ec2_instance_type: str = "t2.micro"
@@ -107,7 +109,7 @@ class AppConfig:
             hf_token=os.getenv("HF_TOKEN"),
             hf_text_model=os.getenv("HF_TEXT_MODEL", cls.hf_text_model),
             hf_vision_model=os.getenv("HF_VISION_MODEL", cls.hf_vision_model),
-            s3_bucket=os.getenv("S3_BUCKET", cls.s3_bucket),
+            s3_bucket=os.getenv("S3_BUCKET"),
             aws_region=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION"),
             ec2_ami_id=os.getenv("EC2_AMI_ID", cls.ec2_ami_id),
             ec2_instance_type=os.getenv("EC2_INSTANCE_TYPE", cls.ec2_instance_type),
@@ -142,7 +144,7 @@ class AppConfig:
             "hf_token": "set" if self.hf_token else "missing",
             "hf_text_model": self.hf_text_model,
             "hf_vision_model": self.hf_vision_model,
-            "s3_bucket": self.s3_bucket,
+            "s3_bucket": self.s3_bucket or "missing",
             "aws_region": self.aws_region or "missing",
             "ec2_ami_id": self.ec2_ami_id,
             "ec2_instance_type": self.ec2_instance_type,
@@ -287,25 +289,69 @@ def launch_instance(config: AppConfig) -> str:
     return response["Instances"][0]["InstanceId"]
 
 
+def validate_s3_key(key: str, *, allow_empty: bool = False) -> str:
+    normalized = key.strip()
+    if not normalized:
+        if allow_empty:
+            return ""
+        raise ValueError("S3 key is required.")
+    if len(normalized.encode("utf-8")) > MAX_S3_KEY_BYTES:
+        raise ValueError(f"S3 key must be {MAX_S3_KEY_BYTES} bytes or smaller.")
+    if normalized.startswith("/") or "\\" in normalized:
+        raise ValueError("S3 key must be relative and use forward slashes.")
+    if any(ord(char) < 32 for char in normalized):
+        raise ValueError("S3 key must not contain control characters.")
+    segments = [segment for segment in normalized.split("/") if segment]
+    if any(segment in {".", ".."} for segment in segments):
+        raise ValueError("S3 key must not contain path traversal segments.")
+    return normalized
+
+
+def validate_s3_prefix(prefix: str) -> str:
+    return validate_s3_key(prefix, allow_empty=True)
+
+
+def validate_local_workspace_path(path_value: str, *, must_exist: bool) -> Path:
+    if not path_value.strip():
+        raise ValueError("Local file path is required.")
+    path = Path(path_value).expanduser().resolve()
+    if not any(path_within_directory(path, root) for root in LOCAL_WORKSPACE_ROOTS):
+        allowed = ", ".join(str(root) for root in LOCAL_WORKSPACE_ROOTS)
+        raise ValueError(f"Local file path must stay inside: {allowed}")
+    if must_exist:
+        if not path.exists():
+            raise ValueError(f"Local file does not exist: {path_value}")
+        if not path.is_file():
+            raise ValueError(f"Local path must be a file: {path_value}")
+    elif path.exists() and path.is_dir():
+        raise ValueError(f"Download destination must be a file path: {path_value}")
+    return path
+
+
 def upload_to_s3(config: AppConfig, file_path: str, key: str) -> str:
+    validated_path = validate_local_workspace_path(file_path, must_exist=True)
+    validated_key = validate_s3_key(key)
     config.require("s3")
     s3_client = boto3_client("s3", config)
-    s3_client.upload_file(file_path, config.s3_bucket, key)
-    return f"s3://{config.s3_bucket}/{key}"
+    s3_client.upload_file(str(validated_path), config.s3_bucket, validated_key)
+    return f"s3://{config.s3_bucket}/{validated_key}"
 
 
 def download_from_s3(config: AppConfig, key: str, destination: str) -> str:
+    validated_key = validate_s3_key(key)
+    validated_destination = validate_local_workspace_path(destination, must_exist=False)
     config.require("s3")
     s3_client = boto3_client("s3", config)
-    s3_client.download_file(config.s3_bucket, key, destination)
-    return destination
+    s3_client.download_file(config.s3_bucket, validated_key, str(validated_destination))
+    return str(validated_destination)
 
 
 def delete_from_s3(config: AppConfig, key: str) -> str:
+    validated_key = validate_s3_key(key)
     config.require("s3")
     s3_client = boto3_client("s3", config)
-    s3_client.delete_object(Bucket=config.s3_bucket, Key=key)
-    return f"Deleted s3://{config.s3_bucket}/{key}"
+    s3_client.delete_object(Bucket=config.s3_bucket, Key=validated_key)
+    return f"Deleted s3://{config.s3_bucket}/{validated_key}"
 
 
 def list_s3_objects(
@@ -314,11 +360,12 @@ def list_s3_objects(
     limit: int = 20,
 ) -> list[dict[str, Any]]:
     limit = bounded_int(limit, "limit", minimum=1, maximum=100)
+    validated_prefix = validate_s3_prefix(prefix)
     config.require("s3")
     s3_client = boto3_client("s3", config)
     response = s3_client.list_objects_v2(
         Bucket=config.s3_bucket,
-        Prefix=prefix,
+        Prefix=validated_prefix,
         MaxKeys=limit,
     )
     return [

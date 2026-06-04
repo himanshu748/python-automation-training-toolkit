@@ -37,6 +37,7 @@ class ConfigTests(unittest.TestCase):
             ["SENDER_EMAIL", "EMAIL_PASSWORD"],
         )
         self.assertEqual(config.missing_for("huggingface"), ["HF_TOKEN"])
+        self.assertEqual(config.missing_for("s3"), ["S3_BUCKET"])
         self.assertEqual(config.missing_for("unknown"), [])
 
     def test_require_raises_actionable_error(self):
@@ -62,6 +63,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result["sender_email"], "set")
         self.assertEqual(result["hf_token"], "missing")
         self.assertEqual(result["email_password"], "missing")
+        self.assertEqual(result["s3_bucket"], "missing")
 
     def test_doctor_command_returns_missing_config_by_feature(self):
         config = project_code.AppConfig()
@@ -152,6 +154,66 @@ class FeatureTests(unittest.TestCase):
             project_code.list_s3_objects(config, limit=0)
 
         self.assertIn("limit must be between 1 and 100", str(caught.exception))
+
+    def test_s3_keys_reject_path_traversal_and_absolute_paths(self):
+        for key in ("../secret.txt", "training-runs/../secret.txt", "/secret.txt", "folder\\secret.txt"):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                project_code.validate_s3_key(key)
+
+    def test_s3_prefix_allows_empty_but_rejects_traversal(self):
+        self.assertEqual(project_code.validate_s3_prefix(""), "")
+        self.assertEqual(project_code.validate_s3_prefix("training-runs/"), "training-runs/")
+
+        with self.assertRaises(ValueError):
+            project_code.validate_s3_prefix("../")
+
+    @patch("apps.api.automation_server.boto3_client")
+    def test_upload_to_s3_validates_file_and_key(self, boto3_client):
+        config = project_code.AppConfig(aws_region="ap-south-1", s3_bucket="training")
+        with tempfile.NamedTemporaryFile(dir=project_code.REPO_ROOT, suffix=".txt") as upload_file:
+            upload_file.write(b"artifact")
+            upload_file.flush()
+
+            result = project_code.upload_to_s3(
+                config,
+                upload_file.name,
+                "training-runs/artifact.txt",
+            )
+
+        client = boto3_client.return_value
+        client.upload_file.assert_called_once_with(
+            unittest.mock.ANY,
+            "training",
+            "training-runs/artifact.txt",
+        )
+        self.assertEqual(result, "s3://training/training-runs/artifact.txt")
+
+    def test_upload_to_s3_rejects_local_path_escape_before_cloud_call(self):
+        config = project_code.AppConfig(aws_region="ap-south-1", s3_bucket="training")
+
+        with self.assertRaises(ValueError) as caught:
+            project_code.upload_to_s3(config, "/etc/hosts", "training-runs/hosts.txt")
+
+        self.assertIn("must stay inside", str(caught.exception))
+
+    @patch("apps.api.automation_server.boto3_client")
+    def test_download_from_s3_validates_destination_and_key(self, boto3_client):
+        config = project_code.AppConfig(aws_region="ap-south-1", s3_bucket="training")
+        destination = project_code.REPO_ROOT / "downloads" / "artifact.txt"
+
+        result = project_code.download_from_s3(
+            config,
+            "training-runs/artifact.txt",
+            str(destination),
+        )
+
+        client = boto3_client.return_value
+        client.download_file.assert_called_once_with(
+            "training",
+            "training-runs/artifact.txt",
+            str(destination.resolve()),
+        )
+        self.assertEqual(result, str(destination.resolve()))
 
     @patch("apps.api.automation_server.generate_text_with_huggingface")
     def test_search_and_generate_uses_huggingface_directly(
