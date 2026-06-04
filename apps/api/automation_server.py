@@ -472,6 +472,9 @@ def validate_local_image_path(image_path: str) -> Path:
     if not image_path.strip():
         raise ValueError("Image path is required.")
     path = Path(image_path).expanduser().resolve()
+    if not any(path_within_directory(path, root) for root in LOCAL_WORKSPACE_ROOTS):
+        allowed = ", ".join(str(root) for root in LOCAL_WORKSPACE_ROOTS)
+        raise ValueError(f"Image path must stay inside: {allowed}")
     if not path.exists():
         raise ValueError(f"Image file does not exist: {image_path}")
     if not path.is_file():

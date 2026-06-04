@@ -254,7 +254,7 @@ class FeatureTests(unittest.TestCase):
             hf_token="hf-token",
             hf_vision_model="org/vision-model",
         )
-        with tempfile.NamedTemporaryFile(suffix=".png") as image_file:
+        with tempfile.NamedTemporaryFile(dir=project_code.REPO_ROOT, suffix=".png") as image_file:
             image_file.write(b"fake-image")
             image_file.flush()
 
@@ -265,7 +265,7 @@ class FeatureTests(unittest.TestCase):
 
     def test_describe_image_rejects_non_image_extension(self):
         config = project_code.AppConfig(hf_token="hf-token")
-        with tempfile.NamedTemporaryFile(suffix=".txt") as text_file:
+        with tempfile.NamedTemporaryFile(dir=project_code.REPO_ROOT, suffix=".txt") as text_file:
             text_file.write(b"not-image")
             text_file.flush()
 
@@ -273,6 +273,17 @@ class FeatureTests(unittest.TestCase):
                 project_code.describe_image(config, text_file.name)
 
         self.assertIn("Image file must use one of these extensions", str(caught.exception))
+
+    def test_describe_image_rejects_local_path_escape(self):
+        config = project_code.AppConfig(hf_token="hf-token")
+        with tempfile.NamedTemporaryFile(suffix=".png") as image_file:
+            image_file.write(b"fake-image")
+            image_file.flush()
+
+            with self.assertRaises(ValueError) as caught:
+                project_code.describe_image(config, image_file.name)
+
+        self.assertIn("Image path must stay inside", str(caught.exception))
 
     @patch("apps.api.automation_server.optional_import")
     @patch("apps.api.automation_server.huggingface_client")
@@ -301,7 +312,7 @@ class FeatureTests(unittest.TestCase):
             hf_token="hf-token",
             hf_vision_model="org/vision-model",
         )
-        with tempfile.NamedTemporaryFile(suffix=".png") as image_file:
+        with tempfile.NamedTemporaryFile(dir=project_code.REPO_ROOT, suffix=".png") as image_file:
             image_file.write(b"fake-image")
             image_file.flush()
 
