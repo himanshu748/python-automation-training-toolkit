@@ -11,25 +11,46 @@ from apps.api import automation_server as project_code
 class ConfigTests(unittest.TestCase):
     def test_config_reads_environment_without_exposing_secrets(self):
         env = {
-            "SENDER_EMAIL": "me@example.com",
-            "EMAIL_PASSWORD": "secret",
-            "HF_TOKEN": "hf-secret",
+            "SENDER_EMAIL": " me@example.com ",
+            "EMAIL_PASSWORD": " secret ",
+            "HF_TOKEN": " hf-secret ",
             "HF_TEXT_MODEL": "test/text-model",
             "HF_VISION_MODEL": "test/vision-model",
             "HF_VISION_PROVIDER": "test-provider",
             "AWS_REGION": "ap-south-1",
-            "S3_BUCKET": "training-bucket",
+            "S3_BUCKET": " training-bucket ",
         }
         with patch.dict(os.environ, env, clear=True):
             config = project_code.AppConfig.from_env()
 
         self.assertEqual(config.sender_email, "me@example.com")
+        self.assertEqual(config.email_password, "secret")
+        self.assertEqual(config.hf_token, "hf-secret")
         self.assertEqual(config.hf_text_model, "test/text-model")
         self.assertEqual(config.hf_vision_model, "test/vision-model")
         self.assertEqual(config.hf_vision_provider, "test-provider")
         self.assertEqual(config.s3_bucket, "training-bucket")
         self.assertEqual(config.safe_settings()["email_password"], "set")
         self.assertNotIn("secret", str(config.safe_settings()))
+
+    def test_blank_environment_values_are_missing(self):
+        env = {
+            "SENDER_EMAIL": "   ",
+            "EMAIL_PASSWORD": "\n",
+            "HF_TOKEN": "\t",
+            "S3_BUCKET": "",
+            "AWS_REGION": "  ",
+            "AWS_DEFAULT_REGION": " ap-south-1 ",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            config = project_code.AppConfig.from_env()
+
+        self.assertIsNone(config.sender_email)
+        self.assertIsNone(config.email_password)
+        self.assertIsNone(config.hf_token)
+        self.assertIsNone(config.s3_bucket)
+        self.assertEqual(config.aws_region, "ap-south-1")
+        self.assertEqual(config.safe_settings()["hf_token"], "missing")
 
     def test_missing_config_is_feature_specific(self):
         config = project_code.AppConfig()
@@ -116,6 +137,22 @@ class FeatureTests(unittest.TestCase):
         handler = project_code.build_tailwind_handler(config)
 
         self.assertTrue(issubclass(handler, project_code.http.server.BaseHTTPRequestHandler))
+
+    def test_result_payload_sanitizes_unexpected_action_errors(self):
+        result = project_code.result_payload(
+            lambda: (_ for _ in ()).throw(RuntimeError("provider leaked hf-token /private/path"))
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "RuntimeError; details omitted")
+        self.assertNotIn("hf-token", result["error"])
+
+    def test_result_payload_preserves_validation_errors(self):
+        result = project_code.result_payload(
+            lambda: (_ for _ in ()).throw(ValueError("S3 key is required."))
+        )
+
+        self.assertEqual(result, {"ok": False, "error": "S3 key is required."})
 
     def test_location_provider_failures_are_sanitized(self):
         def fail_ipapi():

@@ -73,6 +73,13 @@ ROUTES = {
 }
 
 
+def clean_env_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def dependency_installed(module_name: str) -> bool:
     try:
         return importlib.util.find_spec(module_name) is not None
@@ -109,16 +116,17 @@ class AppConfig:
     @classmethod
     def from_env(cls) -> "AppConfig":
         return cls(
-            sender_email=os.getenv("SENDER_EMAIL"),
-            email_password=os.getenv("EMAIL_PASSWORD"),
-            hf_token=os.getenv("HF_TOKEN"),
-            hf_text_model=os.getenv("HF_TEXT_MODEL", cls.hf_text_model),
-            hf_vision_model=os.getenv("HF_VISION_MODEL", cls.hf_vision_model),
-            hf_vision_provider=os.getenv("HF_VISION_PROVIDER", cls.hf_vision_provider),
-            s3_bucket=os.getenv("S3_BUCKET"),
-            aws_region=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION"),
-            ec2_ami_id=os.getenv("EC2_AMI_ID", cls.ec2_ami_id),
-            ec2_instance_type=os.getenv("EC2_INSTANCE_TYPE", cls.ec2_instance_type),
+            sender_email=clean_env_value(os.getenv("SENDER_EMAIL")),
+            email_password=clean_env_value(os.getenv("EMAIL_PASSWORD")),
+            hf_token=clean_env_value(os.getenv("HF_TOKEN")),
+            hf_text_model=clean_env_value(os.getenv("HF_TEXT_MODEL")) or cls.hf_text_model,
+            hf_vision_model=clean_env_value(os.getenv("HF_VISION_MODEL")) or cls.hf_vision_model,
+            hf_vision_provider=clean_env_value(os.getenv("HF_VISION_PROVIDER")) or cls.hf_vision_provider,
+            s3_bucket=clean_env_value(os.getenv("S3_BUCKET")),
+            aws_region=clean_env_value(os.getenv("AWS_REGION"))
+            or clean_env_value(os.getenv("AWS_DEFAULT_REGION")),
+            ec2_ami_id=clean_env_value(os.getenv("EC2_AMI_ID")) or cls.ec2_ami_id,
+            ec2_instance_type=clean_env_value(os.getenv("EC2_INSTANCE_TYPE")) or cls.ec2_instance_type,
         )
 
     def missing_for(self, feature: str) -> list[str]:
@@ -616,7 +624,13 @@ def result_payload(action: Any) -> dict[str, Any]:
     try:
         return {"ok": True, "result": action()}
     except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": safe_action_error(exc)}
+
+
+def safe_action_error(exc: Exception) -> str:
+    if isinstance(exc, (ConfigError, RequestError, ValueError)):
+        return str(exc)
+    return f"{type(exc).__name__}; details omitted"
 
 
 def bounded_int(value: Any, name: str, minimum: int, maximum: int) -> int:

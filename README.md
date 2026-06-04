@@ -135,6 +135,8 @@ python project_code.py list-s3 --prefix training-runs/ --limit 10
 - Hugging Face prompt/query sizes and generated token counts are bounded, and
   provider failures are returned as generic errors instead of raw provider
   exception text.
+- Browser API workflow failures preserve local validation/configuration errors
+  but summarize unexpected provider/runtime failures without raw details.
 - Use least-privilege credentials for AWS workflows.
 - Scope S3 permissions to the buckets and prefixes your environment needs.
 - Configure `S3_BUCKET` explicitly; the app does not fall back to a shared
