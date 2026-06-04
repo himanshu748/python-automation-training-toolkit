@@ -17,4 +17,5 @@
 - Display secrets only as `set` or `missing`.
 - Keep optional integrations lazy: import external services only when their workflow runs.
 - Keep local HTTP endpoints conservative when they accept filesystem paths.
+- Bound model prompts/output tokens before provider calls, and avoid returning raw provider exceptions.
 - Keep browser workflow buttons user-visible on failure; failed API calls should render in the output panel instead of becoming unhandled promises.

@@ -16,6 +16,7 @@ class ConfigTests(unittest.TestCase):
             "HF_TOKEN": "hf-secret",
             "HF_TEXT_MODEL": "test/text-model",
             "HF_VISION_MODEL": "test/vision-model",
+            "HF_VISION_PROVIDER": "test-provider",
             "AWS_REGION": "ap-south-1",
             "S3_BUCKET": "training-bucket",
         }
@@ -25,6 +26,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.sender_email, "me@example.com")
         self.assertEqual(config.hf_text_model, "test/text-model")
         self.assertEqual(config.hf_vision_model, "test/vision-model")
+        self.assertEqual(config.hf_vision_provider, "test-provider")
         self.assertEqual(config.s3_bucket, "training-bucket")
         self.assertEqual(config.safe_settings()["email_password"], "set")
         self.assertNotIn("secret", str(config.safe_settings()))
@@ -245,14 +247,56 @@ class FeatureTests(unittest.TestCase):
 
         self.assertEqual(result, "HF summary")
         huggingface_client.assert_called_once_with(config, "org/text-model")
+        self.assertEqual(client.chat_completion.call_args.kwargs["max_tokens"], 160)
+
+    def test_generate_text_with_huggingface_bounds_tokens_and_prompt(self):
+        config = project_code.AppConfig(hf_token="hf-token")
+
+        with self.assertRaisesRegex(ValueError, "Prompt must be"):
+            project_code.generate_text_with_huggingface(
+                config,
+                "x" * (project_code.MAX_HF_PROMPT_CHARS + 1),
+            )
+
+        with self.assertRaisesRegex(ValueError, "max_tokens must be"):
+            project_code.generate_text_with_huggingface(
+                config,
+                "short prompt",
+                max_tokens=project_code.MAX_HF_OUTPUT_TOKENS + 1,
+            )
+
+    @patch("apps.api.automation_server.huggingface_client")
+    def test_generate_text_with_huggingface_sanitizes_provider_errors(self, huggingface_client):
+        client = huggingface_client.return_value
+        client.chat_completion.side_effect = RuntimeError("provider leaked hf-token")
+        config = project_code.AppConfig(hf_token="hf-token")
+
+        with self.assertRaises(RuntimeError) as caught:
+            project_code.generate_text_with_huggingface(config, "Summarize this")
+
+        message = str(caught.exception)
+        self.assertIn("Hugging Face text generation failed", message)
+        self.assertNotIn("hf-token", message)
+
+    def test_search_and_generate_bounds_query(self):
+        config = project_code.AppConfig(hf_token="hf-token")
+
+        with self.assertRaisesRegex(ValueError, "Query must be"):
+            project_code.search_and_generate(
+                config,
+                "x" * (project_code.MAX_HF_QUERY_CHARS + 1),
+            )
 
     @patch("apps.api.automation_server.huggingface_client")
     def test_describe_image_uses_huggingface_vision_model(self, huggingface_client):
         client = huggingface_client.return_value
-        client.image_to_text.return_value = [{"generated_text": "a dashboard screenshot"}]
+        client.chat_completion.return_value = {
+            "choices": [{"message": {"content": "a dashboard screenshot"}}]
+        }
         config = project_code.AppConfig(
             hf_token="hf-token",
             hf_vision_model="org/vision-model",
+            hf_vision_provider="test-provider",
         )
         with tempfile.NamedTemporaryFile(dir=project_code.REPO_ROOT, suffix=".png") as image_file:
             image_file.write(b"fake-image")
@@ -261,7 +305,16 @@ class FeatureTests(unittest.TestCase):
             result = project_code.describe_image(config, image_file.name)
 
         self.assertEqual(result, "a dashboard screenshot")
-        huggingface_client.assert_called_once_with(config, "org/vision-model")
+        huggingface_client.assert_called_once_with(
+            config,
+            "org/vision-model",
+            provider="test-provider",
+        )
+        request = client.chat_completion.call_args.kwargs
+        self.assertEqual(request["max_tokens"], 80)
+        content = request["messages"][0]["content"]
+        self.assertEqual(content[0]["type"], "text")
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
 
     def test_describe_image_rejects_non_image_extension(self):
         config = project_code.AppConfig(hf_token="hf-token")
@@ -285,48 +338,22 @@ class FeatureTests(unittest.TestCase):
 
         self.assertIn("Image path must stay inside", str(caught.exception))
 
-    @patch("apps.api.automation_server.optional_import")
     @patch("apps.api.automation_server.huggingface_client")
-    def test_describe_image_falls_back_to_direct_inference_api(
-        self,
-        huggingface_client,
-        optional_import,
-    ):
+    def test_image_to_text_with_huggingface_sanitizes_provider_errors(self, huggingface_client):
         client = huggingface_client.return_value
-        client.image_to_text.side_effect = StopIteration()
-        response = type(
-            "Response",
-            (),
-            {
-                "raise_for_status": lambda self: None,
-                "json": lambda self: [{"generated_text": "a local training image"}],
-            },
-        )()
-        requests = type(
-            "Requests",
-            (),
-            {"post": unittest.mock.Mock(return_value=response)},
-        )()
-        optional_import.return_value = requests
+        client.chat_completion.side_effect = RuntimeError("provider leaked hf-token")
         config = project_code.AppConfig(
             hf_token="hf-token",
             hf_vision_model="org/vision-model",
+            hf_vision_provider="test-provider",
         )
-        with tempfile.NamedTemporaryFile(dir=project_code.REPO_ROOT, suffix=".png") as image_file:
-            image_file.write(b"fake-image")
-            image_file.flush()
 
-            result = project_code.describe_image(config, image_file.name)
+        with self.assertRaises(RuntimeError) as caught:
+            project_code.image_to_text_with_huggingface(config, b"fake-image", "image/png")
 
-        self.assertEqual(result, "a local training image")
-        requests.post.assert_called_once()
-        request_url = requests.post.call_args.args[0]
-        request_headers = requests.post.call_args.kwargs["headers"]
-        self.assertEqual(
-            request_url,
-            "https://api-inference.huggingface.co/models/org/vision-model",
-        )
-        self.assertEqual(request_headers["Authorization"], "Bearer hf-token")
+        message = str(caught.exception)
+        self.assertIn("Hugging Face image captioning failed", message)
+        self.assertNotIn("hf-token", message)
 
     def test_static_asset_path_helper_rejects_escape(self):
         root = project_code.ASSETS_DIR

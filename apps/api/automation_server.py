@@ -10,6 +10,7 @@ workflow.
 from __future__ import annotations
 
 import argparse
+import base64
 import http.server
 import importlib
 import importlib.util
@@ -40,12 +41,15 @@ FEATURE_DEPENDENCIES = {
     "ec2": ["boto3"],
     "s3": ["boto3"],
     "search_summary": ["huggingface_hub"],
-    "image_detection": ["huggingface_hub", "requests"],
+    "image_detection": ["huggingface_hub"],
 }
 
 DEFAULT_S3_PREFIX = "training-runs/"
 MAX_JSON_BODY_BYTES = 1_000_000
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_HF_QUERY_CHARS = 1_000
+MAX_HF_PROMPT_CHARS = 4_000
+MAX_HF_OUTPUT_TOKENS = 512
 MAX_S3_KEY_BYTES = 1_024
 IMAGE_SUFFIXES = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -95,7 +99,8 @@ class AppConfig:
     email_password: str | None = None
     hf_token: str | None = None
     hf_text_model: str = "Qwen/Qwen2.5-1.5B-Instruct"
-    hf_vision_model: str = "Salesforce/blip-image-captioning-base"
+    hf_vision_model: str = "CohereLabs/aya-vision-32b"
+    hf_vision_provider: str = "cohere"
     s3_bucket: str | None = None
     aws_region: str | None = None
     ec2_ami_id: str = "ami-09298640a92b2d12c"
@@ -109,6 +114,7 @@ class AppConfig:
             hf_token=os.getenv("HF_TOKEN"),
             hf_text_model=os.getenv("HF_TEXT_MODEL", cls.hf_text_model),
             hf_vision_model=os.getenv("HF_VISION_MODEL", cls.hf_vision_model),
+            hf_vision_provider=os.getenv("HF_VISION_PROVIDER", cls.hf_vision_provider),
             s3_bucket=os.getenv("S3_BUCKET"),
             aws_region=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION"),
             ec2_ami_id=os.getenv("EC2_AMI_ID", cls.ec2_ami_id),
@@ -144,6 +150,7 @@ class AppConfig:
             "hf_token": "set" if self.hf_token else "missing",
             "hf_text_model": self.hf_text_model,
             "hf_vision_model": self.hf_vision_model,
+            "hf_vision_provider": self.hf_vision_provider,
             "s3_bucket": self.s3_bucket or "missing",
             "aws_region": self.aws_region or "missing",
             "ec2_ami_id": self.ec2_ami_id,
@@ -380,10 +387,26 @@ def list_s3_objects(
     ]
 
 
-def huggingface_client(config: AppConfig, model: str) -> Any:
+def huggingface_client(
+    config: AppConfig,
+    model: str,
+    provider: str | None = None,
+) -> Any:
     config.require("huggingface")
     huggingface_hub = optional_import("huggingface_hub")
-    return huggingface_hub.InferenceClient(model=model, api_key=config.hf_token)
+    kwargs = {"model": model, "api_key": config.hf_token}
+    if provider:
+        kwargs["provider"] = provider
+    return huggingface_hub.InferenceClient(**kwargs)
+
+
+def bounded_text(value: str, name: str, max_chars: int) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{name} is required.")
+    if len(normalized) > max_chars:
+        raise ValueError(f"{name} must be {max_chars} characters or fewer.")
+    return normalized
 
 
 def extract_hf_text(response: Any) -> str:
@@ -428,44 +451,74 @@ def generate_text_with_huggingface(
     prompt: str,
     max_tokens: int = 160,
 ) -> str:
+    safe_prompt = bounded_text(prompt, "Prompt", MAX_HF_PROMPT_CHARS)
+    safe_max_tokens = bounded_int(
+        max_tokens,
+        "max_tokens",
+        minimum=1,
+        maximum=MAX_HF_OUTPUT_TOKENS,
+    )
     client = huggingface_client(config, config.hf_text_model)
     messages = [
         {
             "role": "system",
             "content": "You write concise, practical summaries for developer tooling workflows.",
         },
-        {"role": "user", "content": prompt},
+        {"role": "user", "content": safe_prompt},
     ]
 
-    if hasattr(client, "chat_completion"):
-        response = client.chat_completion(
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=0.4,
-        )
-    else:
-        response = client.text_generation(prompt, max_new_tokens=max_tokens)
-    return extract_hf_text(response)
+    try:
+        if hasattr(client, "chat_completion"):
+            response = client.chat_completion(
+                messages=messages,
+                max_tokens=safe_max_tokens,
+                temperature=0.4,
+            )
+        else:
+            response = client.text_generation(safe_prompt, max_new_tokens=safe_max_tokens)
+        return extract_hf_text(response)
+    except Exception as exc:
+        raise RuntimeError(
+            "Hugging Face text generation failed. Check the token, model, and provider availability."
+        ) from exc
 
 
-def image_to_text_with_inference_api(
+def image_to_text_with_huggingface(
     config: AppConfig,
     image_bytes: bytes,
+    mime_type: str,
 ) -> str:
-    config.require("huggingface")
-    requests = optional_import("requests")
-    response = requests.post(
-        f"https://api-inference.huggingface.co/models/{config.hf_vision_model}",
-        headers={"Authorization": f"Bearer {config.hf_token}"},
-        data=image_bytes,
-        timeout=60,
+    client = huggingface_client(
+        config,
+        config.hf_vision_model,
+        provider=config.hf_vision_provider,
     )
-    response.raise_for_status()
+    data_url = (
+        f"data:{mime_type};base64,"
+        + base64.b64encode(image_bytes).decode("ascii")
+    )
     try:
-        payload = response.json()
-    except ValueError:
-        payload = response.text
-    return extract_hf_text(payload)
+        response = client.chat_completion(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Describe this image in one concise sentence.",
+                        },
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ],
+            max_tokens=80,
+            temperature=0.1,
+        )
+        return extract_hf_text(response)
+    except Exception as exc:
+        raise RuntimeError(
+            "Hugging Face image captioning failed. Check the token, model, and provider availability."
+        ) from exc
 
 
 def validate_local_image_path(image_path: str) -> Path:
@@ -487,26 +540,39 @@ def validate_local_image_path(image_path: str) -> Path:
     return path
 
 
+def image_mime_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".png":
+        return "image/png"
+    if suffix == ".webp":
+        return "image/webp"
+    if suffix == ".gif":
+        return "image/gif"
+    if suffix == ".bmp":
+        return "image/bmp"
+    return "application/octet-stream"
+
+
 def describe_image(config: AppConfig, image_path: str) -> str:
     validated_path = validate_local_image_path(image_path)
-    client = huggingface_client(config, config.hf_vision_model)
     with io.open(validated_path, "rb") as image_file:
         image_bytes = image_file.read()
-    try:
-        response = client.image_to_text(image_bytes)
-        return extract_hf_text(response)
-    except Exception:
-        return image_to_text_with_inference_api(config, image_bytes)
+    return image_to_text_with_huggingface(
+        config,
+        image_bytes,
+        image_mime_type(validated_path),
+    )
 
 
 def search_and_generate(config: AppConfig, query: str) -> str:
-    if not query.strip():
-        raise ValueError("Query is required.")
+    safe_query = bounded_text(query, "Query", MAX_HF_QUERY_CHARS)
     prompt = (
         "Write a concise, practical summary for a developer training workflow.\n"
         "Use current general knowledge from the model. Include clear next steps "
         "when useful, and avoid pretending to browse the web.\n\n"
-        f"Topic: {query.strip()}"
+        f"Topic: {safe_query}"
     )
     return generate_text_with_huggingface(config, prompt)
 

@@ -57,7 +57,8 @@ Minimum model configuration:
 ```bash
 export HF_TOKEN="hf_..."
 export HF_TEXT_MODEL="Qwen/Qwen2.5-1.5B-Instruct"
-export HF_VISION_MODEL="Salesforce/blip-image-captioning-base"
+export HF_VISION_MODEL="CohereLabs/aya-vision-32b"
+export HF_VISION_PROVIDER="cohere"
 ```
 
 AWS workflows use credentials from your shell/profile plus region and bucket
@@ -131,6 +132,9 @@ python project_code.py list-s3 --prefix training-runs/ --limit 10
 - The web server binds to `127.0.0.1` by default, bounds JSON request bodies,
   and validates local image, upload, download, S3 key, and S3 prefix inputs
   before invoking external services.
+- Hugging Face prompt/query sizes and generated token counts are bounded, and
+  provider failures are returned as generic errors instead of raw provider
+  exception text.
 - Use least-privilege credentials for AWS workflows.
 - Scope S3 permissions to the buckets and prefixes your environment needs.
 - Configure `S3_BUCKET` explicitly; the app does not fall back to a shared
@@ -152,7 +156,8 @@ python project_code.py doctor
 | --- | --- |
 | `HF_TOKEN` | Required Hugging Face hosted inference token |
 | `HF_TEXT_MODEL` | Hugging Face text/chat model for summaries |
-| `HF_VISION_MODEL` | Hugging Face image captioning model |
+| `HF_VISION_MODEL` | Hugging Face vision-language model for image captions |
+| `HF_VISION_PROVIDER` | Hugging Face inference provider for the vision model |
 | `AWS_REGION` or `AWS_DEFAULT_REGION` | AWS client region |
 | `S3_BUCKET` | Default S3 bucket |
 | `EC2_AMI_ID` | AMI used by `launch-ec2` |
