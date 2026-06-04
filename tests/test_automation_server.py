@@ -117,6 +117,28 @@ class FeatureTests(unittest.TestCase):
 
         self.assertTrue(issubclass(handler, project_code.http.server.BaseHTTPRequestHandler))
 
+    def test_location_provider_failures_are_sanitized(self):
+        def fail_ipapi():
+            raise RuntimeError("ipapi failed with hf-token and /private/local/path")
+
+        def fail_geocoder():
+            raise RuntimeError("geocoder failed with secret and /private/other/path")
+
+        with patch.object(project_code, "location_from_ipapi", fail_ipapi), patch.object(
+            project_code,
+            "location_from_geocoder",
+            fail_geocoder,
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                project_code.get_location_info()
+
+        message = str(caught.exception)
+        self.assertIn("fail_ipapi: RuntimeError; details omitted", message)
+        self.assertIn("fail_geocoder: RuntimeError; details omitted", message)
+        self.assertNotIn("hf-token", message)
+        self.assertNotIn("secret", message)
+        self.assertNotIn("/private/local/path", message)
+
     @patch("apps.api.automation_server.boto3_client")
     def test_list_s3_objects_returns_small_serializable_records(self, boto3_client):
         client = boto3_client.return_value

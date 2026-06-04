@@ -198,6 +198,10 @@ def compact_location_payload(
     }
 
 
+def summarize_provider_failure(provider_name: str, exc: BaseException) -> str:
+    return f"{provider_name}: {type(exc).__name__}; details omitted"
+
+
 def location_from_ipapi() -> dict[str, Any]:
     requests = optional_import("requests")
     response = requests.get("https://ipapi.co/json/", timeout=10)
@@ -252,7 +256,7 @@ def get_location_info() -> dict[str, Any]:
         try:
             return provider()
         except Exception as exc:
-            errors.append(f"{provider.__name__}: {exc}")
+            errors.append(summarize_provider_failure(provider.__name__, exc))
     raise RuntimeError("Could not determine location. " + " | ".join(errors))
 
 
